@@ -1,163 +1,182 @@
 // ============================================================
-// TIA Portal V17+ — SCL Kaynak Kodu
-// Pompa Basınç Kontrol Sistemi — PID Kontrolör
+// TIA Portal V17+ — SCL Source Code
+// Pump Pressure Control System — Discrete-Time PID Controller
 //
-// Blok   : FB100  "PumpPressureControl"
-// Çağrı  : Her OB35 (100 ms) döngüsünde çağrılmalıdır
-// Yazar  : Otomatik dönüşüm
+// Block  : FB100  "PumpPressureControl"
+// Calling: Must be invoked from OB35 (cyclic interrupt, 100 ms cycle time)
+// Author : Mehmet Haydar, I&C Automation Engineer, Germany
+// Std    : IEC 61131-3, ISA-5.1
 // ============================================================
 
 // ────────────────────────────────────────────────────────────
-// 1. VERİ BLOĞU TANIMI  (Instance DB — FB100_DB)
-//    TIA Portal'da FB oluşturduğunuzda otomatik üretilir.
-//    Aşağıdaki değişkenler FB'nin static bölümündedir.
+// 1. INSTANCE DATA BLOCK NOTE  (FB100_DB)
+//    The instance DB is created automatically by TIA Portal
+//    when the FB is first called. The variables below reside
+//    in the STATIC section of the FB and persist between scans.
 // ────────────────────────────────────────────────────────────
 
 (*
-  STATIC değişkenler (FB Internal Memory):
-    integral     : REAL  := 0.0;
-    prev_error   : REAL  := 0.0;
-    first_scan   : BOOL  := TRUE;
-    pv_filtered  : REAL  := 0.0;
+  STATIC variables (retained across scan cycles):
+    integral     : REAL  := 0.0;   // Integral accumulator [error × s]
+    prev_error   : REAL  := 0.0;   // Control deviation from previous scan
+    first_scan   : BOOL  := TRUE;  // First-execution flag
+    pv_filtered  : REAL  := 0.0;   // Low-pass filtered process variable
 *)
 
 // ────────────────────────────────────────────────────────────
-// 2. FONKSİYON BLOĞU
+// 2. FUNCTION BLOCK DECLARATION
 // ────────────────────────────────────────────────────────────
 
 FUNCTION_BLOCK "PumpPressureControl"
 
-// ── Arayüz Tanımları ────────────────────────────────────────
+// ── Interface Variable Declarations ─────────────────────────
 VAR_INPUT
-    // Operatörden / SCADA'dan gelen değerler
-    setpoint    : REAL;         // Hedef basınç [bar]
-    pv          : REAL;         // Ölçülen basınç (AI) [bar]
-    enable      : BOOL;         // Kontrolörü aktif et
-    manual_mode : BOOL;         // Manuel mod
-    manual_out  : REAL;         // Manuel mod çıkışı [%]
+    // Operator / SCADA interface
+    setpoint    : REAL;         // Pressure setpoint (SP) [bar]
+    pv          : REAL;         // Measured process variable from AI transmitter [bar]
+    enable      : BOOL;         // Controller enable (TRUE = AUTO mode active)
+    manual_mode : BOOL;         // Manual override request from HMI/SCADA
+    manual_out  : REAL;         // Manual output value when manual_mode = TRUE [%]
 
-    // PID parametreleri (çalışma zamanı ayarlanabilir)
-    Kp          : REAL := 1.2;
-    Ki          : REAL := 0.5;
-    Kd          : REAL := 0.1;
-    dt          : REAL := 0.1;  // Örnekleme süresi [s] — OB35 = 0.1 s
+    // PID tuning parameters (adjustable at runtime via HMI)
+    Kp          : REAL := 1.2;  // Proportional gain
+    Ki          : REAL := 0.5;  // Integral gain [1/s]
+    Kd          : REAL := 0.1;  // Derivative gain [s]
+    dt          : REAL := 0.1;  // Scan cycle time [s] — must match OB35 period
 
-    // Çıkış limitleri
-    out_min     : REAL := 0.0;
-    out_max     : REAL := 100.0;
+    // Output limits for the manipulated variable (MV)
+    out_min     : REAL := 0.0;   // Minimum controller output (MV low clamp) [%]
+    out_max     : REAL := 100.0; // Maximum controller output (MV high clamp) [%]
 
-    // Alarm eşikleri
-    pv_high_lim : REAL := 6.0;  // Yüksek basınç alarmı [bar]
-    pv_low_lim  : REAL := 0.5;  // Düşük basınç alarmı [bar]
+    // Process alarm thresholds
+    pv_high_lim : REAL := 6.0;  // High-pressure alarm setpoint [bar]
+    pv_low_lim  : REAL := 0.5;  // Low-pressure alarm setpoint [bar]
 END_VAR
 
 VAR_OUTPUT
-    control_out   : REAL;       // Pompa frekans sürücüsüne çıkış [%]
-    error         : REAL;       // Anlık hata [bar]
-    alarm_high    : BOOL;       // Yüksek basınç alarmı
-    alarm_low     : BOOL;       // Düşük basınç alarmı
-    alarm_fault   : BOOL;       // Genel arıza (PV geçersiz)
-    status_word   : WORD;       // Durum kelimesi (SCADA için)
+    control_out   : REAL;       // Controller output — manipulated variable (MV) [%]
+    error         : REAL;       // Current control deviation: SP - PV [bar]
+    alarm_high    : BOOL;       // High-pressure process alarm (latched with delay)
+    alarm_low     : BOOL;       // Low-pressure process alarm (latched with delay)
+    alarm_fault   : BOOL;       // Transmitter fault — PV out of valid range
+    status_word   : WORD;       // Controller status register for HMI/SCADA
 END_VAR
 
 VAR_IN_OUT
-    // Dışarıdan resetlenebilir sayaçlar
-    total_run_time : DINT;      // Toplam çalışma süresi [s]
+    // External-resettable accumulator (operator reset via HMI)
+    total_run_time : DINT;      // Cumulative pump operating time [OB35 scan counts]
 END_VAR
 
 VAR
-    // PID iç hafızası (static)
-    integral       : REAL := 0.0;
-    prev_error     : REAL := 0.0;
-    first_scan     : BOOL := TRUE;
+    // --- PID internal state (static, retained between scans) ---
+    integral       : REAL := 0.0;    // Integral accumulator
+    prev_error     : REAL := 0.0;    // Previous scan control deviation
+    first_scan     : BOOL := TRUE;   // Suppresses derivative spike on first execution
 
-    // Hesaplama yardımcıları
-    P_term         : REAL;
-    I_term         : REAL;
-    D_term         : REAL;
-    raw_output     : REAL;
-    d_error        : REAL;
+    // --- Intermediate calculation variables ---
+    P_term         : REAL;           // Proportional contribution
+    I_term         : REAL;           // Integral contribution
+    D_term         : REAL;           // Derivative contribution
+    raw_output     : REAL;           // Unsaturated PID sum before output clamping
+    d_error        : REAL;           // Derivative of control deviation
 
-    // Anti-windup yardımcısı
-    output_clamped : BOOL;
+    // --- Anti-windup flag ---
+    output_clamped : BOOL;           // TRUE when MV is saturated at output limit
 
-    // Filtre (1. derece LP — opsiyonel)
+    // --- First-order low-pass filter for PV noise rejection ---
     pv_filtered    : REAL;
-    filter_alpha   : REAL := 0.85;   // α = 0..1, yüksek = yavaş filtre
+    filter_alpha   : REAL := 0.85;   // Filter coefficient α ∈ [0,1]; higher = more filtering
 
-    // Alarm gecikme sayaçları
+    // --- Alarm debounce counters (prevent false trips on noise) ---
     high_alarm_cnt : INT := 0;
     low_alarm_cnt  : INT := 0;
-    ALARM_DELAY    : INT := 5;       // scan sayısı (5 × 100ms = 500ms)
+    ALARM_DELAY    : INT := 5;       // Required consecutive scans before alarm trips (5 × 100 ms = 500 ms)
 END_VAR
 
+
 // ────────────────────────────────────────────────────────────
-// 3. PROGRAM GÖVDESI
+// 3. PROGRAM BODY
+//    Execution sequence mirrors ISA-18.2 alarm hierarchy:
+//      1. PV validation  →  2. PV filtering  →  3. Mode selection
+//      →  4. Enable check  →  5. PID computation  →  6. Anti-windup
+//      →  7. Alarm evaluation  →  8. Status register update
 // ────────────────────────────────────────────────────────────
 BEGIN
 
-    // ── 3.1 PV Geçerlilik Kontrolü ─────────────────────────
+    // ── 3.1 Process Variable (PV) Range Validation ──────────
+    // If the transmitter signal is outside the physical instrument range,
+    // declare a fault, force output to 0%, and return immediately.
     IF (pv < -0.5) OR (pv > 15.0) THEN
         alarm_fault  := TRUE;
         control_out  := 0.0;
-        status_word  := W#16#0080;   // bit7 = FAULT
+        status_word  := W#16#0080;   // Bit 7 = FAULT
         RETURN;
     ELSE
         alarm_fault := FALSE;
     END_IF;
 
-    // ── 3.2 PV Alçak-Geçiren Filtresi ──────────────────────
-    // y[k] = α·y[k-1] + (1-α)·x[k]
+    // ── 3.2 First-Order Low-Pass Filter on PV ───────────────
+    // Discrete filter equation: y[k] = α·y[k-1] + (1-α)·x[k]
+    // Reduces high-frequency measurement noise before PID computation.
     IF first_scan THEN
-        pv_filtered := pv;           // İlk scan'de filtre geçmişi yoktur
+        pv_filtered := pv;   // Initialize filter state — no history on first scan
     ELSE
         pv_filtered := filter_alpha * pv_filtered + (1.0 - filter_alpha) * pv;
     END_IF;
 
-    // ── 3.3 Manuel / Oto Mod Seçimi ────────────────────────
+    // ── 3.3 Operating Mode Selection ────────────────────────
+    // MANUAL mode: pass through the operator-commanded output directly.
+    // Integral tracking is maintained to ensure bumpless transfer
+    // back to AUTO mode (pre-loads integral so output is continuous).
     IF manual_mode THEN
         control_out := manual_out;
-        // Manuel modda integral'i takip et (bumpless transfer)
-        integral    := manual_out / Ki;
-        status_word := W#16#0002;    // bit1 = MANUAL
+        integral    := manual_out / Ki;   // Integral pre-load for bumpless AUTO transfer
+        status_word := W#16#0002;         // Bit 1 = MANUAL
         RETURN;
     END_IF;
 
-    // ── 3.4 Enable Kontrolü ─────────────────────────────────
+    // ── 3.4 Controller Enable Check ─────────────────────────
+    // When disabled, drive output to 0%, reset integral accumulator,
+    // and assert first_scan so the derivative term reinitializes on next enable.
     IF NOT enable THEN
         control_out := 0.0;
         integral    := 0.0;
         first_scan  := TRUE;
-        status_word := W#16#0000;    // IDLE
+        status_word := W#16#0000;   // IDLE / disabled
         RETURN;
     END_IF;
 
-    // ── 3.5 PID Hesaplama ───────────────────────────────────
+    // ── 3.5 PID Control Law Computation ─────────────────────
 
-    // Hata
+    // Control deviation: e[k] = SP - PV_filtered
     error := setpoint - pv_filtered;
 
-    // P terimi
+    // Proportional term: P = Kp · e[k]
     P_term := Kp * error;
 
-    // I terimi — ön hesap (anti-windup sonrası güncellenir)
+    // Integral term: pre-accumulate before anti-windup correction
+    // I[k] = I[k-1] + Ki · e[k] · dt
     integral := integral + error * dt;
     I_term   := Ki * integral;
 
-    // D terimi — türev kick'i önlemek için error üzerinden
+    // Derivative term: computed on error signal (not PV) to avoid
+    // derivative kick on setpoint step changes.
+    // First-scan protection: D = 0 on initial execution cycle.
     IF first_scan THEN
         D_term     := 0.0;
         first_scan := FALSE;
     ELSE
-        d_error := (error - prev_error) / dt;
+        d_error := (error - prev_error) / dt;   // Finite difference approximation
         D_term  := Kd * d_error;
     END_IF;
     prev_error := error;
 
-    // Ham çıkış
+    // Unsaturated controller output: u[k] = P + I + D
     raw_output := P_term + I_term + D_term;
 
-    // ── 3.6 Anti-Windup (Back-Calculation) ──────────────────
+    // ── 3.6 Output Clamping with Anti-Windup ────────────────
+    // Back-calculation anti-windup: if the raw output saturates,
+    // undo the most recent integral increment to prevent integrator wind-up.
     output_clamped := FALSE;
 
     IF raw_output > out_max THEN
@@ -170,22 +189,25 @@ BEGIN
         control_out := raw_output;
     END_IF;
 
-    // Çıkış sınırı aşıldıysa integrali geri al
+    // Revert last integration step when output is clamped
     IF output_clamped THEN
         integral := integral - error * dt;
     END_IF;
 
-    // ── 3.7 Alarm Mantığı (gecikmeli) ──────────────────────
+    // ── 3.7 Process Alarm Evaluation (ISA-18.2 with debounce) ──
+    // Alarms require ALARM_DELAY consecutive qualifying scans before activating.
+    // This prevents nuisance trips from transient measurement noise.
 
-    // Yüksek basınç alarmı
+    // High-pressure alarm: PV exceeds upper threshold
     IF pv_filtered >= pv_high_lim THEN
         high_alarm_cnt := high_alarm_cnt + 1;
     ELSE
-        high_alarm_cnt := 0;
+        high_alarm_cnt := 0;   // Reset counter on non-qualifying scan
     END_IF;
     alarm_high := (high_alarm_cnt >= ALARM_DELAY);
 
-    // Düşük basınç alarmı (sadece enable AND çıkış > 20%)
+    // Low-pressure alarm: PV below lower threshold while pump is commanded on
+    // Condition guard (control_out > 20%) prevents spurious low-pressure alarm on startup
     IF enable AND (control_out > 20.0) AND (pv_filtered <= pv_low_lim) THEN
         low_alarm_cnt := low_alarm_cnt + 1;
     ELSE
@@ -193,19 +215,23 @@ BEGIN
     END_IF;
     alarm_low := (low_alarm_cnt >= ALARM_DELAY);
 
-    // ── 3.8 Çalışma Süresi Sayacı ──────────────────────────
+    // ── 3.8 Pump Operating Time Accumulator ─────────────────
+    // Incremented every OB35 scan while the pump is running (MV > 0%).
+    // Useful for predictive maintenance scheduling.
     IF enable AND (control_out > 0.0) THEN
-        total_run_time := total_run_time + 1;   // her OB35 çağrısı = +0.1s
+        total_run_time := total_run_time + 1;   // Each count = one OB35 scan = 0.1 s
     END_IF;
 
-    // ── 3.9 Durum Kelimesi (SCADA / HMI) ───────────────────
-    // Bit yapısı:
-    //   Bit 0 : AUTO
-    //   Bit 1 : MANUAL
-    //   Bit 2 : ALARM_HIGH
-    //   Bit 3 : ALARM_LOW
-    //   Bit 7 : FAULT
-    status_word := W#16#0001;   // AUTO
+    // ── 3.9 Controller Status Register (HMI / SCADA) ────────
+    // Encodes operating mode and alarm states in a single WORD for
+    // efficient transport over PROFINET/OPC-UA to the HMI/SCADA system.
+    //
+    //   Bit 0 : AUTO mode active
+    //   Bit 1 : MANUAL mode active
+    //   Bit 2 : ALARM_HIGH active
+    //   Bit 3 : ALARM_LOW active
+    //   Bit 7 : FAULT (transmitter out of range)
+    status_word := W#16#0001;   // Default: AUTO
     IF alarm_high THEN
         status_word := status_word OR W#16#0004;
     END_IF;
@@ -217,8 +243,9 @@ END_FUNCTION_BLOCK
 
 
 // ────────────────────────────────────────────────────────────
-// 4. OB35 — DÖNGÜSEL KESMELİ GÖREV (100 ms)
-//    Bu blok TIA Portal'da OB35 içinde FB100'ü çağırır
+// 4. OB35 — CYCLIC INTERRUPT ORGANIZATION BLOCK (100 ms)
+//    This OB calls FB100 on every cyclic interrupt execution.
+//    OB35 period must match the dt parameter passed to FB100.
 // ────────────────────────────────────────────────────────────
 
 ORGANIZATION_BLOCK "CyclicInterrupt" [OB35]
@@ -228,23 +255,23 @@ VAR_TEMP
 END_VAR
 
 BEGIN
-    // FB100 çağrısı — Instance DB: "PumpCtrl_DB" (DB100)
+    // Invoke FB100 using its instance DB (PumpPressureControl_DB / DB100)
     "PumpPressureControl_DB"(
-        setpoint    := "DB_HMI".pressure_setpoint,   // HMI setpoint [bar]
-        pv          := "DB_IO".AI_pressure_bar,       // Ölçülen basınç [bar]
-        enable      := "DB_HMI".pump_enable,          // HMI enable
-        manual_mode := "DB_HMI".manual_mode,
-        manual_out  := "DB_HMI".manual_output,
+        setpoint    := "DB_HMI".pressure_setpoint,   // Operator setpoint from HMI [bar]
+        pv          := "DB_IO".AI_pressure_bar,       // Scaled AI from pressure transmitter [bar]
+        enable      := "DB_HMI".pump_enable,          // Pump enable command from HMI
+        manual_mode := "DB_HMI".manual_mode,          // Manual mode request from HMI
+        manual_out  := "DB_HMI".manual_output,        // Manual output value from HMI [%]
         Kp          := 1.2,
         Ki          := 0.5,
         Kd          := 0.1,
-        dt          := 0.1,                           // OB35 = 100 ms
+        dt          := 0.1,                           // Scan cycle time = OB35 period [s]
         out_min     := 0.0,
         out_max     := 100.0,
         pv_high_lim := 6.0,
         pv_low_lim  := 0.5,
-        control_out  => "DB_IO".AO_pump_speed_pct,   // VFD'ye 4-20mA çıkışı
-        error        => "DB_HMI".pid_error,
+        control_out  => "DB_IO".AO_pump_speed_pct,   // MV to VFD speed reference [%]
+        error        => "DB_HMI".pid_error,           // Control deviation for HMI display
         alarm_high   => "AlarmDB".pump_pressure_high,
         alarm_low    => "AlarmDB".pump_pressure_low,
         alarm_fault  => "AlarmDB".pump_pressure_fault,
@@ -252,7 +279,8 @@ BEGIN
         total_run_time := "DB_HMI".pump_run_time
     );
 
-    // AO ölçekleme: 0-100% → 0-27648 (Siemens AI/AO raw değeri)
+    // Scale AO output: 0–100 % → 0–27648 (Siemens S7 16-bit analog raw value)
+    // Corresponds to 4–20 mA on analog output module to VFD
     "DB_IO".AO_pump_raw :=
         REAL_TO_INT("DB_IO".AO_pump_speed_pct / 100.0 * 27648.0);
 
@@ -260,32 +288,35 @@ END_ORGANIZATION_BLOCK
 
 
 // ────────────────────────────────────────────────────────────
-// 5. KULLANIM NOTLARI
+// 5. HARDWARE WIRING & INTEGRATION NOTES
 // ────────────────────────────────────────────────────────────
 (*
-  DONANIM BAĞLANTILARI
-  ─────────────────────
-  AI_pressure_bar  : Basınç transmitteri (4-20 mA → 0-10 bar)
-                     Tag tablosunda ölçekleme: 0=0 bar, 27648=10 bar
-  AO_pump_raw      : VFD (Frekans Sürücüsü) referans girişi
-                     0=0%, 27648=100% (4-20mA çıkış modülü)
+  FIELD INSTRUMENT CONNECTIONS
+  ─────────────────────────────
+  AI_pressure_bar  : Pressure transmitter, 4–20 mA loop, range 0–10 bar
+                     PLC tag scaling: raw 0 = 0 bar, raw 27648 = 10 bar
+  AO_pump_raw      : Variable-frequency drive (VFD) speed reference input
+                     raw 0 = 0%, raw 27648 = 100% (4–20 mA analog output module)
 
-  OB35 PERİYODU
-  ─────────────
-  OB35 varsayılan periyodu 100 ms → dt=0.1 parametresiyle eşleşmelidir.
-  Farklı periyot için dt parametresini saniye cinsinden güncelleyin.
+  OB35 CYCLE TIME
+  ────────────────
+  Default OB35 period: 100 ms — must match dt = 0.1 s in FB100 call.
+  To change the scan rate, update both the OB35 period property
+  and the dt input parameter accordingly.
 
-  BUMPLESS TRANSFER
-  ─────────────────
-  Manuel → Auto geçişinde integral takip aktiftir.
-  SCADA'dan manual_mode=FALSE yapıldığında ani çıkış değişimi olmaz.
+  BUMPLESS TRANSFER (MANUAL → AUTO)
+  ───────────────────────────────────
+  While in MANUAL mode, the integral accumulator tracks the manual output:
+    integral := manual_out / Ki
+  When the operator switches back to AUTO, the integral is pre-loaded
+  so the controller output is continuous — eliminating the bump.
 
-  TIA PORTAL PROJE YAPISI
-  ────────────────────────
+  TIA PORTAL PROJECT BLOCK STRUCTURE
+  ────────────────────────────────────
   Program blocks/
-    FB100 — PumpPressureControl  (bu dosya)
-    DB100 — PumpPressureControl_DB  (instance DB, otomatik)
-    DB101 — DB_HMI               (HMI paylaşımlı veri bloğu)
-    DB102 — DB_IO                 (I/O etiket veritabanı)
-    OB35  — CyclicInterrupt       (100 ms görevi)
+    FB100 — PumpPressureControl       (this file)
+    DB100 — PumpPressureControl_DB    (instance DB — auto-generated)
+    DB101 — DB_HMI                    (HMI shared data block)
+    DB102 — DB_IO                     (I/O tag mirror data block)
+    OB35  — CyclicInterrupt           (100 ms cyclic task)
 *)
