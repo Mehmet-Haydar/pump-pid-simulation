@@ -46,8 +46,8 @@ pump-pid-simulation/
 
 ## Related Projects
 
-- [Stewart Platform](https://github.com/Mehmet-Haydar/Stewart_Platform) — 6-DOF kinematics
 - [Automation Learning](https://github.com/Mehmet-Haydar/automation-learning) — My PLC/automation journey
+- [Industrial Troubleshooting](https://github.com/Mehmet-Haydar/industrial-troubleshooting) — Field problem solutions
 
 ## License
 
