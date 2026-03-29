@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pump Pressure Control System — PID Simulation
-Setpoint: 4 bar | Kp=1.5  Ki=0.5  Kd=0.1
+Setpoint: 4 bar | Kp=2.0  Ki=0.5  Kd=0.1
 Plant model: First-order lag process (tau=3 s, Kp_plant=0.8)
 
 Author  : Mehmet Haydar, I&C Automation Engineer
@@ -179,7 +179,7 @@ def header():
     """Print the simulation table header with column labels."""
     print(f"\n{BOLD}{CYAN}{'─'*78}{RESET}")
     print(f"{BOLD}{CYAN}  PUMP PRESSURE CONTROL SYSTEM — PID SIMULATION{RESET}")
-    print(f"{BOLD}{CYAN}  Kp={1.5}  Ki={0.5}  Kd={0.1}  |  Setpoint: 4.0 bar{RESET}")
+    print(f"{BOLD}{CYAN}  Kp={2.0}  Ki={0.5}  Kd={0.1}  |  Setpoint: 4.0 bar{RESET}")
     print(f"{BOLD}{CYAN}{'─'*78}{RESET}")
     print(f"  {BOLD}{'t(s)':>5}  {'PV(bar)':>8}  {'SP(bar)':>8}  {'Error':>7}  "
           f"{'Out(%)':>9}  {'P-term':>7}  {'I-term':>7}  {'D-term':>7}{RESET}")
@@ -193,7 +193,7 @@ def run_simulation(
         setpoint: float = 4.0,    # Pressure setpoint [bar]
         duration: float = 30.0,   # Total simulation time [s]
         dt: float = 0.5,          # Scan cycle time [s]
-        Kp: float = 1.5,
+        Kp: float = 2.0,
         Ki: float = 0.5,
         Kd: float = 0.1,
         realtime: bool = False,   # If True, pause dt seconds between scans
